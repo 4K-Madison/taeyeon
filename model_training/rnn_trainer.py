@@ -11,6 +11,9 @@ import logging
 import sys
 import json
 import pickle
+import s3fs
+import tempfile
+import posixpath
 
 from dataset import BrainToTextDataset, train_test_split_indicies
 from data_augmentations import gauss_smooth
@@ -22,6 +25,9 @@ torch.set_float32_matmul_precision('high') # makes float32 matmuls faster on som
 torch.backends.cudnn.deterministic = True # makes training more reproducible
 torch._dynamo.config.cache_size_limit = 64
 
+def _amp_dtype():
+    return torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
 from rnn_model import GRUDecoder
 
 class BrainToTextDecoder_Trainer:
@@ -29,6 +35,7 @@ class BrainToTextDecoder_Trainer:
     This class will initialize and train a brain-to-text phoneme decoder
     
     Written by Nick Card and Zachery Fogg with reference to Stanford NPTL's decoding function
+    Modified to support S3 storage
     """
 
     def __init__(self, args):
@@ -55,13 +62,50 @@ class BrainToTextDecoder_Trainer:
 
         self.transform_args = self.args['dataset']['data_transforms']
 
-        # Create output directory
-        if args['mode'] == 'train':
-            os.makedirs(self.args['output_dir'], exist_ok=False)
+        # # Initialize S3 filesystem
+        # self.s3 = s3fs.S3FileSystem(anon=False)
+        # # # self.s3_base_path = 's3://4k-woody-btt/4k/data/hdf5_data_final'
+        # channel_path = os.environ.get('SM_CHANNEL_TRAINING', None)
+        
+        # if channel_path is not None:
+        #     # SageMaker 채널로 받은 로컬 경로
+        #     self.data_base_path = channel_path
+        #     self.use_s3fs = False
+        #     self.logger.info(f'Using local channel data path: {self.data_base_path}')
+        # else:
+        #     # 채널이 없으면 기존 S3 경로 사용
+        #     self.data_base_path = 's3://4k-woody-btt/4k/data/hdf5_data_final'
+        #     self.use_s3fs = True
+        #     self.logger.info(f'Using S3 base path: {self.data_base_path}')
 
-        # Create checkpoint directory
+            
+        # train_file_paths = [
+        #     os.path.join(self.data_base_path, s, 'data_train.hdf5')
+        #     for s in self.args['dataset']['sessions']
+        # ]
+        # val_file_paths = [
+        #     os.path.join(self.data_base_path, s, 'data_val.hdf5')
+        #     for s in self.args['dataset']['sessions']
+        # ]
+
+
+        self.s3 = s3fs.S3FileSystem(anon=False)
+        # Create output directory (support both local and S3 paths)
+        if args['mode'] == 'train':
+            if self.args['output_dir'].startswith('s3://'):
+                self.s3.makedirs(self.args['output_dir'], exist_ok=False)
+            else:
+                os.makedirs(self.args['output_dir'], exist_ok=False)
+
+       
+            
+        
+        # Create checkpoint directory (support both local and S3 paths)
         if args['save_best_checkpoint'] or args['save_all_val_steps'] or args['save_final_model']: 
-            os.makedirs(self.args['checkpoint_dir'], exist_ok=False)
+            if self.args['checkpoint_dir'].startswith('s3://'):
+                self.s3.makedirs(self.args['checkpoint_dir'], exist_ok=False)
+            else:
+                os.makedirs(self.args['checkpoint_dir'], exist_ok=False)
 
         # Set up logging
         self.logger = logging.getLogger(__name__)
@@ -72,7 +116,13 @@ class BrainToTextDecoder_Trainer:
 
         if args['mode']=='train':
             # During training, save logs to file in output directory
-            fh = logging.FileHandler(str(pathlib.Path(self.args['output_dir'],'training_log')))
+            log_path = os.path.join(self.args['output_dir'], 'training_log')
+            if self.args['output_dir'].startswith('s3://'):
+                # For S3, we'll write to a local temp file and upload periodically
+                self.temp_log_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_training_log')
+                fh = logging.FileHandler(self.temp_log_file.name)
+            else:
+                fh = logging.FileHandler(str(pathlib.Path(self.args['output_dir'],'training_log')))
             fh.setFormatter(formatter)
             self.logger.addHandler(fh)
 
@@ -80,6 +130,20 @@ class BrainToTextDecoder_Trainer:
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(formatter)
         self.logger.addHandler(sh)
+
+        
+        channel_path = os.environ.get('SM_CHANNEL_TRAINING', None)
+
+        if channel_path is not None:
+            # SageMaker training 채널로 내려온 로컬 경로
+            self.data_base_path = channel_path
+            self.use_s3fs = False
+            self.logger.info(f'Using local channel data path: {self.data_base_path}')
+        else:
+            # 채널이 없으면 S3 경로 사용
+            self.data_base_path = 's3://4k-woody-btt/4k/data/hdf5_data_final'
+            self.use_s3fs = True
+            self.logger.info(f'Using S3 base path: {self.data_base_path}')
 
         # Configure device pytorch will use 
         if torch.cuda.is_available():
@@ -107,8 +171,7 @@ class BrainToTextDecoder_Trainer:
             self.device = torch.device("cpu")
 
         self.logger.info(f'Using device: {self.device}')
-
-
+        self.logger.info(f'Using data base path: {self.data_base_path}')
 
         # Set seed if provided 
         if self.args['seed'] != -1:
@@ -130,12 +193,21 @@ class BrainToTextDecoder_Trainer:
         )
 
         # Call torch.compile to speed up training
-        self.logger.info("Using torch.compile")
-        self.model = torch.compile(self.model)
+        #elf.logger.info("Using torch.compile")
+        #self.model = torch.compile(self.model)
 
         self.logger.info(f"Initialized RNN decoding model")
 
         self.logger.info(self.model)
+
+        self.model.to(self.device)
+        # torch.compile, 동적 길이와 RNN, pack 사용을 고려해 dynamic=True 권장
+        try:
+            if self.args.get('use_compile', True):
+                self.logger.info("Enabling torch.compile")
+                self.model = torch.compile(self.model, dynamic=True)
+        except Exception as e:
+            self.logger.warning(f"torch.compile disabled, reason: {e}")
 
         # Log how many parameters are in the model
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -149,9 +221,31 @@ class BrainToTextDecoder_Trainer:
         
         self.logger.info(f"Model has {day_params:,} day-specific parameters | {((day_params / total_params) * 100):.2f}% of total parameters")
 
-        # Create datasets and dataloaders
-        train_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_train.hdf5') for s in self.args['dataset']['sessions']]
-        val_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_val.hdf5') for s in self.args['dataset']['sessions']]
+        # Create datasets and dataloaders with S3 paths
+        # Use S3 base path instead of local dataset_dir
+        # train_file_paths = [os.path.join(self.s3_base_path, s, 'data_train.hdf5') for s in self.args['dataset']['sessions']]
+        # val_file_paths = [os.path.join(self.s3_base_path, s, 'data_val.hdf5') for s in self.args['dataset']['sessions']]
+        # train_file_paths = [
+        #     posixpath.join(self.s3_base_path, s, 'data_train.hdf5')
+        #     for s in self.args['dataset']['sessions']
+        # ]
+        # val_file_paths = [
+        #     posixpath.join(self.s3_base_path, s, 'data_val.hdf5')
+        #     for s in self.args['dataset']['sessions']
+        # ]
+
+        # Build file path list(파일 경로 리스트 만들기)
+        train_file_paths = [
+            os.path.join(self.data_base_path, s, 'data_train.hdf5')
+            for s in self.args['dataset']['sessions']
+        ]
+        val_file_paths = [
+            os.path.join(self.data_base_path, s, 'data_val.hdf5')
+            for s in self.args['dataset']['sessions']
+        ]
+        
+        self.logger.info(f"Train file paths: {train_file_paths[:3]}...")  # Log first 3 paths
+        self.logger.info(f"Val file paths: {val_file_paths[:3]}...")
 
         # Ensure that there are no duplicate days
         if len(set(train_file_paths)) != len(train_file_paths):
@@ -174,8 +268,15 @@ class BrainToTextDecoder_Trainer:
             )
 
         # Save dictionaries to output directory to know which trials were train vs val 
-        with open(os.path.join(self.args['output_dir'], 'train_val_trials.json'), 'w') as f: 
-            json.dump({'train' : train_trials, 'val': val_trials}, f)
+        output_path = os.path.join(self.args['output_dir'], 'train_val_trials.json')
+        json_data = json.dumps({'train' : train_trials, 'val': val_trials})
+        
+        if self.args['output_dir'].startswith('s3://'):
+            with self.s3.open(output_path, 'w') as f:
+                f.write(json_data)
+        else:
+            with open(output_path, 'w') as f:
+                f.write(json_data)
 
         # Determine if a only a subset of neural features should be used
         feature_subset = None
@@ -192,7 +293,8 @@ class BrainToTextDecoder_Trainer:
             batch_size = self.args['dataset']['batch_size'],
             must_include_days = None,
             random_seed = self.args['dataset']['seed'],
-            feature_subset = feature_subset
+            feature_subset = feature_subset,
+            use_s3fs = self.use_s3fs
             )
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -211,14 +313,17 @@ class BrainToTextDecoder_Trainer:
             batch_size = self.args['dataset']['batch_size'],
             must_include_days = None,
             random_seed = self.args['dataset']['seed'],
-            feature_subset = feature_subset   
+            feature_subset = feature_subset,
+            use_s3fs = self.use_s3fs
             )
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size = None, # Dataset.__getitem__() already returns batches
             shuffle = False, 
-            num_workers = 0,
-            pin_memory = True 
+            num_workers = 2,
+            pin_memory = True,
+            persistent_workers = True,
+            prefetch_factor = 4
         )
 
         self.logger.info("Successfully initialized datasets")
@@ -364,9 +469,13 @@ class BrainToTextDecoder_Trainer:
         
     def load_model_checkpoint(self, load_path):
         ''' 
-        Load a training checkpoint
+        Load a training checkpoint (supports both local and S3 paths)
         '''
-        checkpoint = torch.load(load_path, weights_only = False) # checkpoint is just a dict
+        if load_path.startswith('s3://'):
+            with self.s3.open(load_path, 'rb') as f:
+                checkpoint = torch.load(f, weights_only=False, map_location='cpu')
+        else:
+            checkpoint = torch.load(load_path, weights_only=False, map_location='cpu')
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -386,7 +495,7 @@ class BrainToTextDecoder_Trainer:
 
     def save_model_checkpoint(self, save_path, PER, loss):
         '''
-        Save a training checkpoint
+        Save a training checkpoint (supports both local and S3 paths)
         '''
 
         checkpoint = {
@@ -397,13 +506,44 @@ class BrainToTextDecoder_Trainer:
             'val_loss' : loss
         }
         
-        torch.save(checkpoint, save_path)
+        if save_path.startswith('s3://'):
+            # Save to temporary file first, then upload to S3
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as tmp_file:
+                torch.save(checkpoint, tmp_file.name)
+                tmp_file.flush()
+                with open(tmp_file.name, 'rb') as f:
+                    with self.s3.open(save_path, 'wb') as s3_file:
+                        s3_file.write(f.read())
+                os.unlink(tmp_file.name)
+        else:
+            torch.save(checkpoint, save_path)
         
         self.logger.info("Saved model to checkpoint: " + save_path)
 
         # Save the args file alongside the checkpoint
-        with open(os.path.join(self.args['checkpoint_dir'], 'args.yaml'), 'w') as f:
-            OmegaConf.save(config=self.args, f=f)
+        args_path = os.path.join(self.args['checkpoint_dir'], 'args.yaml')
+        if self.args['checkpoint_dir'].startswith('s3://'):
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as tmp_file:
+                OmegaConf.save(config=self.args, f=tmp_file)
+                tmp_file.flush()
+                with open(tmp_file.name, 'r') as f:
+                    with self.s3.open(args_path, 'w') as s3_file:
+                        s3_file.write(f.read())
+                os.unlink(tmp_file.name)
+        else:
+            with open(args_path, 'w') as f:
+                OmegaConf.save(config=self.args, f=f)
+
+    def upload_log_to_s3(self):
+        '''Upload temporary log file to S3'''
+        if hasattr(self, 'temp_log_file') and self.args['output_dir'].startswith('s3://'):
+            log_s3_path = os.path.join(self.args['output_dir'], 'training_log')
+            try:
+                with open(self.temp_log_file.name, 'r') as f:
+                    with self.s3.open(log_s3_path, 'w') as s3_file:
+                        s3_file.write(f.read())
+            except Exception as e:
+                self.logger.warning(f"Failed to upload log to S3: {e}")
 
     def create_attention_mask(self, sequence_lengths):
 
@@ -524,25 +664,37 @@ class BrainToTextDecoder_Trainer:
             day_indicies = batch['day_indicies'].to(self.device)
 
             # Use autocast for efficiency
-            with torch.autocast(device_type = "cuda", enabled = self.args['use_amp'], dtype = torch.bfloat16):
-
-                # Apply augmentations to the data
-                features, n_time_steps = self.transform_data(features, n_time_steps, 'train')
-
-                adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
-
-                # Get phoneme predictions 
+            with torch.autocast(
+                device_type="cuda",
+                enabled=self.args['use_amp'],
+                dtype=_amp_dtype()
+            ):
+                # 데이터 증강(data augmentation)
+                features, n_time_steps = self.transform_data(
+                    features, n_time_steps, mode='train'
+                )
+            
+                # 모델 forward, logits: [B, T, C]
                 logits = self.model(features, day_indicies)
-
-                # Calculate CTC Loss
+            
+                # CTC 입력 길이(input_lengths, 입력 길이)를 logits 길이 T로 통일
+                B, T, _ = logits.shape
+                input_lengths = torch.full(
+                    (B,),
+                    T,
+                    dtype=torch.long,
+                    device=logits.device,
+                )
+            
+                # CTC loss(CTC 손실)
                 loss = self.ctc_loss(
-                    log_probs = torch.permute(logits.log_softmax(2), [1, 0, 2]),
-                    targets = labels,
-                    input_lengths = adjusted_lens,
-                    target_lengths = phone_seq_lens
-                    )
-                    
-                loss = torch.mean(loss) # take mean loss over batches
+                    log_probs=torch.permute(logits.log_softmax(2), [1, 0, 2]),
+                    targets=labels,
+                    input_lengths=input_lengths,
+                    target_lengths=phone_seq_lens,
+                )
+            
+                loss = torch.mean(loss)
             
             loss.backward()
 
@@ -614,8 +766,18 @@ class BrainToTextDecoder_Trainer:
 
                     # save validation metrics to pickle file
                     if self.args['save_val_metrics']:
-                        with open(f'{self.args["checkpoint_dir"]}/val_metrics.pkl', 'wb') as f:
-                            pickle.dump(val_metrics, f) 
+                        metrics_path = f'{self.args["checkpoint_dir"]}/val_metrics.pkl'
+                        if self.args['checkpoint_dir'].startswith('s3://'):
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_file:
+                                pickle.dump(val_metrics, tmp_file)
+                                tmp_file.flush()
+                                with open(tmp_file.name, 'rb') as f:
+                                    with self.s3.open(metrics_path, 'wb') as s3_file:
+                                        s3_file.write(f.read())
+                                os.unlink(tmp_file.name)
+                        else:
+                            with open(metrics_path, 'wb') as f:
+                                pickle.dump(val_metrics, f)
 
                     val_steps_since_improvement = 0
                     
@@ -624,23 +786,29 @@ class BrainToTextDecoder_Trainer:
 
                 # Optionally save this validation checkpoint, regardless of performance
                 if self.args['save_all_val_steps']:
-                    self.save_model_checkpoint(f'{self.args["checkpoint_dir"]}/checkpoint_batch_{i}', val_metrics['avg_PER'])
+                    self.save_model_checkpoint(f'{self.args["checkpoint_dir"]}/checkpoint_batch_{i}', val_metrics['avg_PER'], val_metrics['avg_loss'])
 
                 # Early stopping 
                 if early_stopping and (val_steps_since_improvement >= early_stopping_val_steps):
                     self.logger.info(f'Overall validation PER has not improved in {early_stopping_val_steps} validation steps. Stopping training early at batch: {i}')
                     break
+
+                # Periodically upload log to S3
+                if i % (self.args['batches_per_val_step'] * 5) == 0:
+                    self.upload_log_to_s3()
                 
         # Log final training steps 
         training_duration = time.time() - train_start_time
-
 
         self.logger.info(f'Best avg val PER achieved: {self.best_val_PER:.5f}')
         self.logger.info(f'Total training time: {(training_duration / 60):.2f} minutes')
 
         # Save final model 
         if self.args['save_final_model']:
-            self.save_model_checkpoint(f'{self.args["checkpoint_dir"]}/final_checkpoint_batch_{i}', val_PERs[-1])
+            self.save_model_checkpoint(f'{self.args["checkpoint_dir"]}/final_checkpoint_batch_{i}', val_PERs[-1], val_losses[-1])
+
+        # Upload final log to S3
+        self.upload_log_to_s3()
 
         train_stats = {}
         train_stats['train_losses'] = train_losses
@@ -701,17 +869,43 @@ class BrainToTextDecoder_Trainer:
             
             with torch.no_grad():
 
-                with torch.autocast(device_type = "cuda", enabled = self.args['use_amp'], dtype = torch.bfloat16):
-                    features, n_time_steps = self.transform_data(features, n_time_steps, 'val')
-
-                    adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
-
+                with torch.autocast(
+                    device_type="cuda",
+                    enabled=self.args['use_amp'],
+                    dtype=_amp_dtype()
+                ):
+                    features, n_time_steps = self.transform_data(
+                        features, n_time_steps, mode='val'
+                    )
+                    
+                    # 유효한 타임스텝 길이(adjusted_lens) 계산
+                    # patch_size(패치 크기), patch_stride(패치 stride)를 고려해서
+                    # 실제 GRU input 에 해당하는 길이를 구해줍니다.
+                    if self.args['model']['patch_size'] > 0:
+                        adjusted_lens = (
+                            (n_time_steps - self.args['model']['patch_size'])
+                            // self.args['model']['patch_stride']
+                        ) + 1
+                        adjusted_lens = torch.clamp(adjusted_lens, min=1)
+                    else:
+                        adjusted_lens = n_time_steps
+                
+                    # 모델 forward, logits: [B, T, C]
                     logits = self.model(features, day_indicies)
-    
+                
+                    # logits 길이 기반 input_lengths 생성
+                    B, T, _ = logits.shape
+                    input_lengths = torch.full(
+                        (B,),
+                        T,
+                        dtype=torch.long,
+                        device=logits.device,
+                    )
+                
                     loss = self.ctc_loss(
                         torch.permute(logits.log_softmax(2), [1, 0, 2]),
                         labels,
-                        adjusted_lens,
+                        input_lengths,
                         phone_seq_lens,
                     )
                     loss = torch.mean(loss)
@@ -739,7 +933,6 @@ class BrainToTextDecoder_Trainer:
                 
             day_per[day]['total_edit_distance'] += batch_edit_distance
             day_per[day]['total_seq_length'] += torch.sum(phone_seq_lens).item()
-
 
             total_edit_distance += batch_edit_distance
             total_seq_length += torch.sum(phone_seq_lens)

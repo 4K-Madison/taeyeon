@@ -1,5 +1,6 @@
 import torch 
 from torch import nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 class GRUDecoder(nn.Module):
     '''
@@ -43,21 +44,48 @@ class GRUDecoder(nn.Module):
         self.patch_size = patch_size
         self.patch_stride = patch_stride
 
-        # Parameters for the day-specific input layers
-        self.day_layer_activation = nn.Softsign() # basically a shallower tanh 
+        # # Parameters for the day-specific input layers
+        # # self.day_layer_activation = nn.Softsign() # basically a shallower tanh 
 
-        # Set weights for day layers to be identity matrices so the model can learn its own day-specific transformations
-        self.day_weights = nn.ParameterList(
-            [nn.Parameter(torch.eye(self.neural_dim)) for _ in range(self.n_days)]
+        # self.day_layer_activation = nn.Softsign()
+        # day_weights_init = torch.stack(
+        #     [torch.eye(neural_dim) for _ in range(n_days)],
+        #     dim=0,  # [n_days, D, D]
+        # )
+        # self.day_weights = nn.Parameter(day_weights_init)  # [n_days, D, D]
+        # self.day_biases  = nn.Parameter(torch.zeros(n_days, neural_dim))  # [n_days, D]
+        
+        # # Set weights for day layers to be identity matrices so the model can learn its own day-specific transformations
+        # self.day_weights = nn.ParameterList(
+        #     [nn.Parameter(torch.eye(self.neural_dim)) for _ in range(self.n_days)]
+        # )
+        # self.day_biases = nn.ParameterList(
+        #     [nn.Parameter(torch.zeros(1, self.neural_dim)) for _ in range(self.n_days)]
+        # )
+
+        # self.day_layer_dropout = nn.Dropout(input_dropout)
+        
+        # self.input_size = self.neural_dim
+        
+        # Parameters for the day-specific input layers
+        self.day_layer_activation = nn.Softsign()  # basically a shallower tanh 
+
+        # Use single tensors instead of ParameterList for torch.compile compatibility
+        day_weights_init = torch.stack(
+            [torch.eye(self.neural_dim) for _ in range(self.n_days)],
+            dim=0,  # [n_days, D, D]
         )
-        self.day_biases = nn.ParameterList(
-            [nn.Parameter(torch.zeros(1, self.neural_dim)) for _ in range(self.n_days)]
-        )
+        self.day_weights = nn.Parameter(day_weights_init)  # [n_days, neural_dim, neural_dim]
+
+        day_biases_init = torch.zeros(self.n_days, self.neural_dim)  # [n_days, D]
+        self.day_biases = nn.Parameter(day_biases_init)
 
         self.day_layer_dropout = nn.Dropout(input_dropout)
         
         self.input_size = self.neural_dim
 
+
+        
         # If we are using "strided inputs", then the input size of the first recurrent layer will actually be in_size * patch_size
         if self.patch_size > 0:
             self.input_size *= self.patch_size
@@ -85,17 +113,24 @@ class GRUDecoder(nn.Module):
         # Learnable initial hidden states
         self.h0 = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, 1, self.n_units)))
 
-    def forward(self, x, day_idx, states = None, return_state = False):
+    def forward(self, x, day_idx, lengths=None, states=None, return_state=False):
         '''
         x        (tensor)  - batch of examples (trials) of shape: (batch_size, time_series_length, neural_dim)
         day_idx  (tensor)  - tensor which is a list of day indexs corresponding to the day of each example in the batch x. 
         '''
 
         # Apply day-specific layer to (hopefully) project neural data from the different days to the same latent space
-        day_weights = torch.stack([self.day_weights[i] for i in day_idx], dim=0)
-        day_biases = torch.cat([self.day_biases[i] for i in day_idx], dim=0).unsqueeze(1)
+        # day_weights = torch.stack([self.day_weights[i] for i in day_idx], dim=0)
+        # day_biases = torch.cat([self.day_biases[i] for i in day_idx], dim=0).unsqueeze(1)
 
-        x = torch.einsum("btd,bdk->btk", x, day_weights) + day_biases
+        # x = torch.einsum("btd,bdk->btk", x, day_weights) + day_biases
+        # x = self.day_layer_activation(x)
+        # x: [B, T, D], day_idx: [B]
+        day_w = self.day_weights[day_idx]                  # [B, D, D]
+        day_b = self.day_biases[day_idx].unsqueeze(1)      # [B, 1, D]
+
+        x = torch.matmul(x, day_w) + day_b
+        
         x = self.day_layer_activation(x)
 
         # Apply dropout to the ouput of the day specific layer
@@ -122,8 +157,41 @@ class GRUDecoder(nn.Module):
         if states is None:
             states = self.h0.expand(self.n_layers, x.shape[0], self.n_units).contiguous()
 
-        # Pass input through RNN 
-        output, hidden_states = self.gru(x, states)
+        # Pack sequences to skip padded timesteps
+        # if lengths is not None:
+        #     # lengths는 패치 전 시간축 길이로 들어올 수 있으므로, 패치 사용 시 패치 후 길이로 변환
+        #     if self.patch_size > 0:
+        #         # 패치 후 길이 P = floor((L - K) / S) + 1
+        #         patched_lengths = ((lengths - self.patch_size) // self.patch_stride) + 1
+        #         patched_lengths = torch.clamp(patched_lengths, min=1)
+        #         eff_lengths = patched_lengths
+        #     else:
+        #         eff_lengths = lengths
+
+        #     eff_lengths = eff_lengths.to(x.device).to(torch.int64).detach().cpu()
+        #     packed = pack_padded_sequence(x, eff_lengths, batch_first=True, enforce_sorted=False)
+        #     packed_output, hidden_states = self.gru(packed, states)
+        #     output, _ = pad_packed_sequence(packed_output, batch_first=True)
+        # else:
+        #     # 길이가 없으면 기존처럼 전체 타임스텝 연산
+        #     output, hidden_states = self.gru(x, states)
+
+        # GRU, 패딩 구간을 건너뛰도록 패킹
+        if lengths is not None:
+            if self.patch_size > 0:
+                # 패치 사용 시, 길이를 패치 후 길이로 변환
+                eff_lengths = ((lengths - self.patch_size) // self.patch_stride) + 1
+                eff_lengths = torch.clamp(eff_lengths, min=1)
+            else:
+                eff_lengths = lengths
+            packed = pack_padded_sequence(
+                x, eff_lengths.to(torch.int64).detach().cpu(),
+                batch_first=True, enforce_sorted=False
+            )
+            packed_out, hidden_states = self.gru(packed, states)
+            output, _ = pad_packed_sequence(packed_out, batch_first=True)
+        else:
+            output, hidden_states = self.gru(x, states)
 
         # Compute logits
         logits = self.out(output)
